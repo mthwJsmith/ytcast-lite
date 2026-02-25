@@ -1,26 +1,3 @@
-/// Stream resolver — all audio goes through ytresolve's SABR proxy.
-///
-/// ytresolve runs locally on the Pi (or on a VPS) and streams audio using
-/// YouTube's native SABR (Server Adaptive Bit Rate) protocol via the
-/// googlevideo library. This is the same protocol the official YouTube app
-/// uses — it always works regardless of what YouTube does with direct URLs.
-///
-/// YTRESOLVE_URL must be set (e.g. "http://localhost:3033").
-
-static RESOLVE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-static RESOLVE_SECRET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-fn resolve_url() -> &'static str {
-    RESOLVE_URL.get_or_init(|| {
-        std::env::var("YTRESOLVE_URL")
-            .unwrap_or_else(|_| "http://localhost:3033".to_owned())
-    })
-}
-
-fn resolve_secret() -> &'static str {
-    RESOLVE_SECRET.get_or_init(|| std::env::var("YTRESOLVE_SECRET").unwrap_or_default())
-}
-
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Debug, Clone)]
@@ -30,26 +7,87 @@ pub struct StreamInfo {
     pub stream_url: String,
 }
 
-/// Resolve a video ID to a playable audio stream URL via ytresolve SABR proxy.
+/// Resolve a video ID to a playable audio stream URL.
+///
+/// Makes a lightweight InnerTube /player call to get the real title and
+/// duration (needed for YouTube seekbar sync), then returns a localhost URL
+/// that the DIAL server will handle via SABR when MPD connects.
 pub async fn resolve_stream(
-    _client: &reqwest::Client,
+    client: &reqwest::Client,
     video_id: &str,
     _ctt: Option<&str>,
     _playlist_id: Option<&str>,
 ) -> Result<Option<StreamInfo>> {
-    let base = resolve_url().trim_end_matches('/');
-    let secret = resolve_secret();
+    let stream_url = format!("http://localhost:8008/stream/{}", video_id);
 
-    let stream_url = if secret.is_empty() {
-        format!("{}/stream/{}", base, video_id)
-    } else {
-        format!("{}/stream/{}?secret={}", base, video_id, secret)
+    // Quick InnerTube /player call for metadata only (title + duration).
+    // The SABR handler will make its own /player call for the streaming URL.
+    let body = serde_json::json!({
+        "videoId": video_id,
+        "context": {
+            "client": {
+                "clientName": "IOS",
+                "clientVersion": "19.45.4",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "18.1.0.22B83",
+                "hl": "en",
+                "gl": "US",
+            }
+        },
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+    });
+
+    let resp = client
+        .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+        .header(
+            "User-Agent",
+            "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
+        )
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+
+    let (title, duration) = match resp {
+        Ok(r) if r.status().is_success() => {
+            let json: serde_json::Value = r.json().await.unwrap_or_default();
+            let status = json["playabilityStatus"]["status"]
+                .as_str()
+                .unwrap_or("UNKNOWN");
+            if status != "OK" {
+                let reason = json["playabilityStatus"]["reason"]
+                    .as_str()
+                    .unwrap_or("unknown");
+                tracing::warn!("[innertube] {} not playable: {} ({})", video_id, status, reason);
+                return Ok(None);
+            }
+            let t = json["videoDetails"]["title"]
+                .as_str()
+                .unwrap_or(video_id)
+                .to_owned();
+            let d = json["videoDetails"]["lengthSeconds"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            (t, d)
+        }
+        Ok(r) => {
+            tracing::warn!("[innertube] /player HTTP {}, using fallback metadata", r.status());
+            (video_id.to_owned(), 0)
+        }
+        Err(e) => {
+            tracing::warn!("[innertube] /player request failed: {}, using fallback metadata", e);
+            (video_id.to_owned(), 0)
+        }
     };
 
-    tracing::info!("[stream] {video_id} → SABR stream via ytresolve");
+    tracing::info!("[stream] {video_id} → \"{}\" [{}s] via SABR", title, duration);
     Ok(Some(StreamInfo {
-        title: video_id.to_owned(),
-        duration: 0,
+        title,
+        duration,
         stream_url,
     }))
 }

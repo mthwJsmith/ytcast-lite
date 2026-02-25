@@ -6,9 +6,11 @@ use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
+use futures_util::StreamExt;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
+use tokio_stream::wrappers::ReceiverStream;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -29,6 +31,8 @@ pub struct DialState {
     pub local_ip: std::net::Ipv4Addr,
     /// Port this DIAL server listens on.
     pub port: u16,
+    /// Shared HTTP client for outbound requests (e.g. SABR streaming).
+    pub http_client: reqwest::Client,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +53,7 @@ pub async fn run_dial_server(
         .route("/apps/YouTube", get(app_status))
         .route("/apps/YouTube", post(app_launch))
         .route("/apps/YouTube/run", delete(app_stop))
+        .route("/stream/{video_id}", get(stream_audio))
         .with_state(state);
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -129,7 +134,7 @@ async fn device_description(
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
     // The Application-URL header MUST be an absolute URL per DIAL spec Section 5.4.
-    // No trailing slash — matches peer-dial Node.js reference implementation.
+    // No trailing slash -- matches peer-dial Node.js reference implementation.
     let app_url = format!("http://{}:{}/apps", state.local_ip, state.port);
     headers.insert(
         HeaderName::from_static("application-url"),
@@ -140,7 +145,7 @@ async fn device_description(
 }
 
 // ---------------------------------------------------------------------------
-// GET /apps/YouTube — app status
+// GET /apps/YouTube -- app status
 // ---------------------------------------------------------------------------
 
 async fn app_status(
@@ -171,7 +176,7 @@ async fn app_status(
 }
 
 // ---------------------------------------------------------------------------
-// POST /apps/YouTube — launch
+// POST /apps/YouTube -- launch
 // ---------------------------------------------------------------------------
 
 async fn app_launch(
@@ -205,7 +210,7 @@ async fn app_launch(
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /apps/YouTube/run — stop
+// DELETE /apps/YouTube/run -- stop
 // ---------------------------------------------------------------------------
 
 async fn app_stop(
@@ -217,4 +222,69 @@ async fn app_stop(
     tracing::debug!("DIAL {} {} from {}", method, uri, addr);
     state.running.store(false, Ordering::Relaxed);
     StatusCode::OK
+}
+
+// ---------------------------------------------------------------------------
+// GET /stream/:video_id -- SABR audio stream
+// ---------------------------------------------------------------------------
+
+async fn stream_audio(
+    axum::extract::Path(video_id): axum::extract::Path<String>,
+    State(state): State<Arc<DialState>>,
+) -> Response {
+    // Validate video ID (11 chars, alphanumeric + - + _)
+    if !video_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        || video_id.len() != 11
+    {
+        return (StatusCode::BAD_REQUEST, "invalid video id").into_response();
+    }
+
+    match crate::sabr::stream::stream_audio(&state.http_client, &video_id).await {
+        Ok((info, rx)) => {
+            // Build streaming response from the mpsc receiver
+            let stream =
+                ReceiverStream::new(rx).map(|chunk| Ok::<_, std::io::Error>(chunk));
+            let body = axum::body::Body::from_stream(stream);
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                info.mime_type
+                    .parse()
+                    .unwrap_or_else(|_| "audio/webm".parse().unwrap()),
+            );
+            headers.insert(
+                header::TRANSFER_ENCODING,
+                "chunked".parse().unwrap(),
+            );
+            // Replace non-ASCII characters with '?' for a header-safe title
+            let safe_title: String = info
+                .title
+                .chars()
+                .map(|c| if c.is_ascii() { c } else { '?' })
+                .collect();
+            headers.insert(
+                HeaderName::from_static("x-title"),
+                safe_title
+                    .parse()
+                    .unwrap_or_else(|_| "unknown".parse().unwrap()),
+            );
+            headers.insert(
+                HeaderName::from_static("x-duration"),
+                info.duration_secs.to_string().parse().unwrap(),
+            );
+
+            (StatusCode::OK, headers, body).into_response()
+        }
+        Err(e) => {
+            tracing::error!("[stream] {} failed: {}", video_id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("error: {}", e),
+            )
+                .into_response()
+        }
+    }
 }

@@ -4,6 +4,7 @@ mod innertube;
 mod lounge;
 mod messages;
 mod mpd;
+mod sabr;
 mod ssdp;
 
 use std::sync::Arc;
@@ -130,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         uuid: config.uuid.clone(),
         local_ip,
         port: dial_port,
+        http_client: http_client.clone(),
     });
 
     // 11. Spawn background tasks
