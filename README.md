@@ -26,7 +26,7 @@ speakers
 3. Phone sends a video ID — ytcast-open resolves it to an audio stream URL via YouTube's InnerTube API
 4. Audio plays through MPD. Position, duration, and state sync back to the phone in real-time
 
-The audio stream URL is fetched directly from YouTube's CDN using mobile client identities that return pre-signed URLs — no signature decryption, no JavaScript engine, no Python, no yt-dlp.
+The audio stream URL is fetched directly from YouTube's CDN using mobile client identities that return pre-signed URLs — no signature decryption, no JavaScript engine, no Python, no yt-dlp. When direct URLs are unavailable, the included SABR resolver streams audio using YouTube's own native streaming protocol.
 
 ## Features
 
@@ -44,31 +44,35 @@ ytcast-open resolves video IDs to audio streams using YouTube's InnerTube `/play
 | Priority | Method | Status (Feb 2026) |
 |----------|--------|--------------------|
 | 1 | IOS (local) | 20/20 OK — direct URLs, no sig decryption |
-| 2 | **Remote resolver** | YouTube.js on VPS — full sig decryption, most resilient |
+| 2 | **SABR stream** (ytresolve) | Streams audio via YouTube's native SABR protocol — always works |
 | 3 | ANDROID (local) | 20/20 OK — direct URLs, no sig decryption |
 | 4 | ANDROID_VR (local) | ~30% OK — LOGIN_REQUIRED on most videos |
 | 5 | TVHTML5_SIMPLY (local) | Untested — no PO token, no SABR, extra fallback |
 
-Local clients return direct `url` fields (not `signatureCipher`), so no JavaScript engine or signature decryption is needed on the Pi. The remote resolver handles everything including sig decryption when local clients fail.
+Local clients return direct `url` fields (not `signatureCipher`), so no JavaScript engine or signature decryption is needed on the Pi. The SABR fallback uses YouTube's own streaming protocol via the [googlevideo](https://github.com/LuanRT/googlevideo) library — the same protocol the official YouTube app uses.
 
-## Remote stream resolver
+## Remote stream resolver (ytresolve)
 
-The most resilient stream resolution method is a tiny HTTP API on a server with more RAM. ytcast-open calls it as a fallback when the primary IOS client fails — before trying the other local clients.
+A Node.js service that resolves YouTube audio two ways:
 
-**Set up with two env vars:**
+1. **`/resolve/:videoId`** — returns a direct audio URL (fast, same raw InnerTube approach as the Rust binary)
+2. **`/stream/:videoId`** — streams audio via YouTube's SABR protocol (always works, future-proof)
+
+The `/stream/` endpoint uses the [googlevideo](https://github.com/LuanRT/googlevideo) library to speak YouTube's native SABR (Server Adaptive Bit Rate) protocol — the same protocol the official YouTube app uses. This is the long-term solution: when YouTube eventually stops serving direct URLs for mobile clients, SABR will still work because it's YouTube's own streaming protocol, not a workaround.
+
+**~55MB RSS.** No YouTube.js dependency. Just raw InnerTube calls + googlevideo for SABR.
+
+### Deployment
+
+ytresolve can run on the Pi itself (~55MB RAM) or on a VPS for ultra-low Pi RAM usage:
+
 ```bash
-export YTRESOLVE_URL="https://ytresolve.maelo.ca"  # or http://YOUR_SERVER:3033
-export YTRESOLVE_SECRET="your-shared-secret"        # optional auth
-```
+# Run locally on the Pi
+cd ytresolve
+npm install
+YTRESOLVE_SECRET=your-secret node server.js
 
-The resolver is a ~30-line Node.js service using [YouTube.js](https://github.com/LuanRT/YouTube.js) (`youtubei.js`). It handles signature decryption, PO tokens, and SABR — everything YouTube throws at it. Needs ~100-200MB RAM, trivial on a VPS but too heavy for a Pi Zero.
-
-**Why YouTube.js over yt-dlp?** YouTube.js implements YouTube's own protocols (including the new SABR streaming protocol) rather than working around them. It's more future-proof because it speaks the protocol YouTube is converging everything to. yt-dlp works around blocks; YouTube.js implements the actual protocol.
-
-**Included:** See `ytresolve/` directory for the Docker-ready resolver service.
-
-```bash
-# Deploy on your VPS
+# Or deploy on a VPS with Docker
 cd ytresolve
 docker build -t ytresolve .
 docker run -d --name ytresolve -p 3033:3033 \
@@ -76,7 +80,24 @@ docker run -d --name ytresolve -p 3033:3033 \
   ytresolve
 ```
 
-**Without a remote resolver:** ytcast-open works fine standalone — it just uses local InnerTube clients. The remote resolver is insurance for when YouTube blocks mobile clients.
+**Connect to ytcast-open:**
+```bash
+export YTRESOLVE_URL="http://localhost:3033"  # or https://your-vps:3033
+export YTRESOLVE_SECRET="your-shared-secret"
+```
+
+### How SABR streaming works
+
+When ytcast-open calls `/stream/:videoId`, ytresolve:
+1. Makes a raw InnerTube `/player` call (IOS client, no SABR capability advertised)
+2. Gets the SABR streaming URL + format metadata from the response
+3. Opens a SABR session using googlevideo's `SabrStream`
+4. Pipes opus audio chunks directly to the HTTP response
+5. MPD plays the stream as a regular HTTP audio source
+
+The SABR session handles server redirects, backoff, retries, and format negotiation automatically.
+
+**Without a remote resolver:** ytcast-open works fine standalone — it just uses local InnerTube clients for direct URLs. The resolver is insurance for when YouTube blocks mobile client direct URLs.
 
 ## Requirements
 
