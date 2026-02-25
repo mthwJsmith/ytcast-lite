@@ -7,18 +7,98 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 // ---------------------------------------------------------------------------
 // Client identities — tried in order until one returns a playable stream.
 //
-// ANDROID_VR: Direct URLs (no signature decryption), no tokens needed.
-//   Fails on: "made for kids" content, some A/B bot detection.
+// IOS: Direct URLs (no sig decryption), no PO token required (for now).
+//   Best coverage in testing: 20/20 videos OK.
 //
-// WEB_EMBEDDED_PLAYER: Handles kids content + most restrictions.
-//   Returns direct URLs for many videos (no JS needed).
-//   Some videos may only have signatureCipher (we skip those).
+// ANDROID: Same direct URLs, same coverage. Backup if IOS gets blocked.
+//
+// ANDROID_VR: Was the original client. YouTube started returning
+//   LOGIN_REQUIRED ("Sign in to confirm you're not a bot") on ~70% of
+//   videos as of 25 Feb 2026. Kept as fallback.
+//
+// TVHTML5_SIMPLY: Lightweight TV client. No PO token, no SABR, returns
+//   direct URLs. Untested coverage — added as extra fallback before giving up.
 // ---------------------------------------------------------------------------
 
 struct ClientIdentity {
     name: &'static str,
-    payload: Value,
+    context: Value,
     user_agent: &'static str,
+}
+
+fn ios_client(video_id: &str, ctt: Option<&str>, playlist_id: Option<&str>) -> ClientIdentity {
+    let mut context = json!({
+        "client": {
+            "clientName": "IOS",
+            "clientVersion": "21.02.3",
+            "deviceMake": "Apple",
+            "deviceModel": "iPhone16,2",
+            "osName": "iPhone",
+            "osVersion": "18.3.2.22D82"
+        }
+    });
+
+    if let Some(token) = ctt {
+        context["user"] = json!({
+            "enableSafetyMode": false,
+            "lockedSafetyMode": false,
+            "credentialTransferTokens": [{
+                "scope": "VIDEO",
+                "token": token
+            }]
+        });
+    }
+
+    let mut payload = json!({
+        "context": context,
+        "videoId": video_id
+    });
+    if let Some(pid) = playlist_id {
+        payload["playlistId"] = json!(pid);
+    }
+
+    ClientIdentity {
+        name: "IOS",
+        context: payload,
+        user_agent: "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+    }
+}
+
+fn android_client(video_id: &str, ctt: Option<&str>, playlist_id: Option<&str>) -> ClientIdentity {
+    let mut context = json!({
+        "client": {
+            "clientName": "ANDROID",
+            "clientVersion": "21.02.35",
+            "androidSdkVersion": 30,
+            "osName": "Android",
+            "osVersion": "11"
+        }
+    });
+
+    if let Some(token) = ctt {
+        context["user"] = json!({
+            "enableSafetyMode": false,
+            "lockedSafetyMode": false,
+            "credentialTransferTokens": [{
+                "scope": "VIDEO",
+                "token": token
+            }]
+        });
+    }
+
+    let mut payload = json!({
+        "context": context,
+        "videoId": video_id
+    });
+    if let Some(pid) = playlist_id {
+        payload["playlistId"] = json!(pid);
+    }
+
+    ClientIdentity {
+        name: "ANDROID",
+        context: payload,
+        user_agent: "com.google.android.youtube/21.02.35 (Linux; U; Android 11) gzip",
+    }
 }
 
 fn android_vr_client(video_id: &str, ctt: Option<&str>, playlist_id: Option<&str>) -> ClientIdentity {
@@ -47,42 +127,51 @@ fn android_vr_client(video_id: &str, ctt: Option<&str>, playlist_id: Option<&str
         "context": context,
         "videoId": video_id
     });
-
     if let Some(pid) = playlist_id {
         payload["playlistId"] = json!(pid);
     }
 
     ClientIdentity {
         name: "ANDROID_VR",
-        payload,
+        context: payload,
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.71.26 \
             (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
     }
 }
 
-fn web_embedded_client(video_id: &str, playlist_id: Option<&str>) -> ClientIdentity {
-    let mut payload = json!({
-        "context": {
-            "client": {
-                "clientName": "WEB_EMBEDDED_PLAYER",
-                "clientVersion": "1.20260115.01.00"
-            },
-            "thirdParty": {
-                "embedUrl": "https://www.youtube.com/"
-            }
-        },
-        "videoId": video_id
+fn tv_simply_client(video_id: &str, ctt: Option<&str>, playlist_id: Option<&str>) -> ClientIdentity {
+    let mut context = json!({
+        "client": {
+            "clientName": "TVHTML5_SIMPLY",
+            "clientVersion": "2.0",
+            "deviceMake": "",
+            "deviceModel": ""
+        }
     });
 
+    if let Some(token) = ctt {
+        context["user"] = json!({
+            "enableSafetyMode": false,
+            "lockedSafetyMode": false,
+            "credentialTransferTokens": [{
+                "scope": "VIDEO",
+                "token": token
+            }]
+        });
+    }
+
+    let mut payload = json!({
+        "context": context,
+        "videoId": video_id
+    });
     if let Some(pid) = playlist_id {
         payload["playlistId"] = json!(pid);
     }
 
     ClientIdentity {
-        name: "WEB_EMBEDDED",
-        payload,
-        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-            (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        name: "TVHTML5_SIMPLY",
+        context: payload,
+        user_agent: "Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.5)",
     }
 }
 
@@ -101,13 +190,11 @@ pub struct StreamInfo {
 // Resolver
 // ---------------------------------------------------------------------------
 
-/// Resolve a playable audio stream URL for a YouTube video.
+/// Resolve a playable audio stream URL via InnerTube.
 ///
-/// Tries ANDROID_VR first (direct URLs, no tokens). Falls back to
-/// WEB_EMBEDDED_PLAYER for videos that ANDROID_VR can't handle
-/// (made-for-kids, some bot detection).
-///
-/// Returns `Ok(None)` when no client can provide a playable stream.
+/// Tries IOS → ANDROID → ANDROID_VR → TVHTML5_SIMPLY in order. All return
+/// direct URLs (no signature decryption needed). Returns `Ok(None)` when
+/// no client can provide a playable stream.
 pub async fn resolve_stream(
     client: &reqwest::Client,
     video_id: &str,
@@ -115,8 +202,10 @@ pub async fn resolve_stream(
     playlist_id: Option<&str>,
 ) -> Result<Option<StreamInfo>> {
     let clients = [
+        ios_client(video_id, ctt, playlist_id),
+        android_client(video_id, ctt, playlist_id),
         android_vr_client(video_id, ctt, playlist_id),
-        web_embedded_client(video_id, playlist_id),
+        tv_simply_client(video_id, ctt, playlist_id),
     ];
 
     for identity in &clients {
@@ -126,11 +215,11 @@ pub async fn resolve_stream(
         }
     }
 
+    tracing::error!("[stream] all clients failed for {video_id}");
     Ok(None)
 }
 
-/// Try a single InnerTube client identity. Returns None if unplayable or
-/// no direct audio URL available.
+/// Try a single InnerTube client identity.
 async fn try_client(
     client: &reqwest::Client,
     video_id: &str,
@@ -139,7 +228,7 @@ async fn try_client(
     let res = client
         .post(INNERTUBE_URL)
         .header("User-Agent", identity.user_agent)
-        .json(&identity.payload)
+        .json(&identity.context)
         .send()
         .await?;
 
@@ -169,27 +258,17 @@ async fn try_client(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    // Pick highest-bitrate audio stream with a direct URL
     if let Some(url) = best_audio_url(&data["streamingData"]["adaptiveFormats"]) {
-        tracing::info!("[stream] {} resolved {} via {}", identity.name, video_id, identity.name);
-        return Ok(Some(StreamInfo {
-            title,
-            duration,
-            stream_url: url,
-        }));
+        tracing::info!("[stream] resolved {video_id} via {}", identity.name);
+        return Ok(Some(StreamInfo { title, duration, stream_url: url }));
     }
 
-    // Fallback: progressive formats
     if let Some(url) = first_playable_url(&data["streamingData"]["formats"]) {
-        tracing::info!("[stream] {} resolved {} (progressive) via {}", identity.name, video_id, identity.name);
-        return Ok(Some(StreamInfo {
-            title,
-            duration,
-            stream_url: url,
-        }));
+        tracing::info!("[stream] resolved {video_id} (progressive) via {}", identity.name);
+        return Ok(Some(StreamInfo { title, duration, stream_url: url }));
     }
 
-    tracing::warn!("[stream] {} returned OK but no direct URLs for {}", identity.name, video_id);
+    tracing::warn!("[stream] {} OK but no direct URLs for {}", identity.name, video_id);
     Ok(None)
 }
 
@@ -197,8 +276,8 @@ async fn try_client(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// From adaptive formats, pick the audio stream with the highest bitrate that
-/// has a direct `url` (i.e. not signature-ciphered).
+/// From adaptive formats, pick the audio stream with the highest bitrate
+/// that has a direct `url` (not signature-ciphered).
 fn best_audio_url(formats: &Value) -> Option<String> {
     let arr = formats.as_array()?;
 
@@ -212,7 +291,6 @@ fn best_audio_url(formats: &Value) -> Option<String> {
         })
         .collect();
 
-    // Sort by bitrate descending (highest first)
     audio_formats.sort_by(|a, b| {
         let br_a = a["bitrate"].as_u64().unwrap_or(0);
         let br_b = b["bitrate"].as_u64().unwrap_or(0);
