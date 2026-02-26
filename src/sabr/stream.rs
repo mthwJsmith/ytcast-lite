@@ -50,12 +50,12 @@ struct InnerTubeClient {
 
 const IOS_CLIENT: InnerTubeClient = InnerTubeClient {
     client_name: "IOS",
-    client_version: "19.45.4",
+    client_version: "21.02.3",
     device_make: "Apple",
     device_model: "iPhone16,2",
     os_name: "iPhone",
     os_version: "18.1.0.22B83",
-    user_agent: "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
+    user_agent: "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
     client_name_id: 5,
     android_sdk_version: None,
 };
@@ -76,7 +76,7 @@ const ANDROID_CLIENT: InnerTubeClient = InnerTubeClient {
 /// available from a cast session, since IOS/ANDROID reject the ctt with HTTP 400.
 const WEB_REMIX_CLIENT: InnerTubeClient = InnerTubeClient {
     client_name: "WEB_REMIX",
-    client_version: "1.20241120.01.00",
+    client_version: "1.20260114.03.00",
     device_make: "",
     device_model: "",
     os_name: "",
@@ -86,14 +86,91 @@ const WEB_REMIX_CLIENT: InnerTubeClient = InnerTubeClient {
     android_sdk_version: None,
 };
 
+/// Regular YouTube web client. Used with GVS PoToken to bypass 60s throttle.
+/// This is what yt-dlp uses for SABR streaming.
+const WEB_CLIENT: InnerTubeClient = InnerTubeClient {
+    client_name: "WEB",
+    client_version: "2.20241126.01.00",
+    device_make: "",
+    device_model: "",
+    os_name: "",
+    os_version: "",
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    client_name_id: 1,
+    android_sdk_version: None,
+};
+
 // ---------------------------------------------------------------------------
 // PoToken (Proof of Origin) — fetched from bgutil-pot sidecar
 // ---------------------------------------------------------------------------
 
+/// GVS PoToken + visitor_data pair.
+/// The GVS token is content-bound (to video_id) per YouTube's 2026 experiment.
+/// visitor_data is generated locally (protobuf) to establish a session context.
+struct GvsToken {
+    po_token: String,
+    visitor_data: String,
+}
+
+/// Generate a visitor_data string like YouTube.js does:
+/// protobuf { field1: random_11_chars, field5: unix_timestamp }
+/// then base64url-encode it.
+fn generate_visitor_data() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let chars: Vec<u8> = (0..11)
+        .map(|_| {
+            let idx = rng.gen_range(0..62u8);
+            match idx {
+                0..=25 => b'A' + idx,
+                26..=51 => b'a' + (idx - 26),
+                _ => b'0' + (idx - 52),
+            }
+        })
+        .collect();
+    let random_id = String::from_utf8(chars).unwrap();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Manual protobuf encoding:
+    // field 1 (string) = tag 0x0a, then varint length, then bytes
+    // field 5 (int64)  = tag 0x28, then varint value
+    let mut buf = Vec::with_capacity(32);
+    // field 1: tag = (1 << 3) | 2 = 0x0a
+    buf.push(0x0a);
+    buf.push(random_id.len() as u8);
+    buf.extend_from_slice(random_id.as_bytes());
+    // field 5: tag = (5 << 3) | 0 = 0x28
+    buf.push(0x28);
+    // varint encode timestamp
+    let mut val = timestamp as u64;
+    loop {
+        let byte = (val & 0x7f) as u8;
+        val >>= 7;
+        if val == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf)
+}
+
 /// Fetch a PoToken from the bgutil-pot HTTP server (localhost:4416).
-/// Returns None if the server isn't running or fails.
-async fn fetch_po_token(http: &reqwest::Client, video_id: &str) -> Option<String> {
-    let body = serde_json::json!({ "content_binding": video_id });
+///
+/// `content_binding` controls what the token is bound to:
+///   - `Some(video_id)` → content-bound (for WEB/MWEB clients)
+///   - `None` / empty → session-bound / visitor_data-bound (for WEB_REMIX)
+async fn fetch_pot_token(http: &reqwest::Client, content_binding: Option<&str>) -> Option<GvsToken> {
+    let body = match content_binding {
+        Some(cb) if !cb.is_empty() => serde_json::json!({"content_binding": cb}),
+        _ => serde_json::json!({}),
+    };
+
     let resp = http
         .post("http://127.0.0.1:4416/get_pot")
         .json(&body)
@@ -108,9 +185,19 @@ async fn fetch_po_token(http: &reqwest::Client, video_id: &str) -> Option<String
     }
 
     let json: serde_json::Value = resp.json().await.ok()?;
-    let token = json["poToken"].as_str()?.to_owned();
-    tracing::info!("[sabr] got PoToken for {} ({}...)", video_id, &token[..token.len().min(20)]);
-    Some(token)
+    let po_token = json["poToken"].as_str()?.to_owned();
+
+    // Generate visitor_data locally (like YouTube.js does) instead of using
+    // bgutil-pot's contentBinding field, which contains the video ID — NOT valid visitor_data.
+    let visitor_data = generate_visitor_data();
+
+    tracing::info!(
+        "[sabr] got PoToken ({}...) binding={}, visitor_data={}...",
+        &po_token[..po_token.len().min(20)],
+        content_binding.unwrap_or("<session>"),
+        &visitor_data[..visitor_data.len().min(20)],
+    );
+    Some(GvsToken { po_token, visitor_data })
 }
 
 // ---------------------------------------------------------------------------
@@ -138,21 +225,28 @@ struct AdaptiveFormat {
 // InnerTube /player call
 // ---------------------------------------------------------------------------
 
-async fn innertube_player(
-    http: &reqwest::Client,
-    video_id: &str,
+/// Build a minimal InnerTube context from hardcoded client constants.
+/// Used when no YtMusicSession is available (IOS/ANDROID/WEB, or WEB_REMIX without cookies).
+fn build_minimal_context(
     itclient: &InnerTubeClient,
     ctt: Option<&str>,
-    po_token: Option<&str>,
-) -> Result<PlayerData, SabrError> {
+    visitor_data: Option<&str>,
+) -> serde_json::Value {
     let mut client_obj = serde_json::json!({
         "clientName": itclient.client_name,
         "clientVersion": itclient.client_version,
         "hl": "en",
         "gl": "US",
+        "timeZone": "UTC",
+        "utcOffsetMinutes": 0,
     });
 
-    // Only include device fields if non-empty (WEB_REMIX doesn't use them).
+    if let Some(vd) = visitor_data {
+        if !vd.is_empty() {
+            client_obj["visitorData"] = serde_json::json!(vd);
+        }
+    }
+
     if !itclient.device_make.is_empty() {
         client_obj["deviceMake"] = serde_json::json!(itclient.device_make);
         client_obj["deviceModel"] = serde_json::json!(itclient.device_model);
@@ -175,43 +269,187 @@ async fn innertube_player(
         });
     }
 
+    context
+}
+
+async fn innertube_player(
+    http: &reqwest::Client,
+    video_id: &str,
+    itclient: &InnerTubeClient,
+    ctt: Option<&str>,
+    visitor_data: Option<&str>,
+    po_token: Option<&str>,
+    yt_cookies: Option<&crate::cookies::YtCookies>,
+    yt_session: Option<&crate::cookies::YtMusicSession>,
+    oauth_token: Option<&str>,
+) -> Result<PlayerData, SabrError> {
+    let is_web_remix = itclient.client_name == "WEB_REMIX";
+
+    // --- Build context ---
+    // When we have a live YtMusicSession (from fetching music.youtube.com),
+    // use the full 22+ field INNERTUBE_CONTEXT. Without this, WEB_REMIX /player
+    // returns UNPLAYABLE. yt-dlp always fetches the page first for this reason.
+    let (context, sig_timestamp) = if is_web_remix {
+        if let Some(session) = yt_session {
+            let mut ctx = session.innertube_context.clone();
+            // Merge ctt credentials into the existing user object
+            if let Some(token) = ctt {
+                if let Some(user) = ctx.get_mut("user").and_then(|u| u.as_object_mut()) {
+                    user.insert(
+                        "credentialTransferTokens".to_owned(),
+                        serde_json::json!([{
+                            "scope": "VIDEO",
+                            "token": token,
+                        }]),
+                    );
+                }
+            }
+            (ctx, session.signature_timestamp)
+        } else {
+            // No session — build minimal context (may fail with UNPLAYABLE)
+            (build_minimal_context(itclient, ctt, visitor_data), None)
+        }
+    } else {
+        // Non-WEB_REMIX (IOS, ANDROID, WEB): always use minimal context
+        (build_minimal_context(itclient, ctt, visitor_data), None)
+    };
+
+    // --- Build playbackContext ---
+    let mut playback_ctx = serde_json::json!({
+        "contentPlaybackContext": {
+            "html5Preference": "HTML5_PREF_WANTS",
+        }
+    });
+    if let Some(sts) = sig_timestamp {
+        playback_ctx["contentPlaybackContext"]["signatureTimestamp"] = serde_json::json!(sts);
+    }
+
+    // --- Build request body ---
     let mut body = serde_json::json!({
         "videoId": video_id,
         "context": context,
         "contentCheckOk": true,
         "racyCheckOk": true,
+        "playbackContext": playback_ctx,
     });
 
-    if let Some(pot) = po_token {
+    if let Some(token) = po_token {
         body["serviceIntegrityDimensions"] = serde_json::json!({
-            "poToken": pot,
+            "poToken": token,
         });
     }
 
-    // WEB_REMIX uses music.youtube.com, others use www.youtube.com.
-    let is_web_remix = itclient.client_name == "WEB_REMIX";
+    // --- URL ---
+    // Authenticated WEB_REMIX doesn't send API key (matches yt-dlp).
     let url = if is_web_remix {
-        "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
+        if yt_cookies.is_some() {
+            "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
+        } else {
+            "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false"
+        }
     } else {
         "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
     };
 
+    // Client version from live session (changes frequently) or hardcoded constant.
+    let client_version = if let Some(session) = yt_session {
+        session.innertube_context.get("client")
+            .and_then(|c| c.get("clientVersion"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(itclient.client_version)
+    } else {
+        itclient.client_version
+    };
+
     tracing::info!(
-        "[sabr] innertube /player for {} using {}{}",
+        "[sabr] innertube /player for {} using {} v{}{}{}{}{}{}",
         video_id,
         itclient.client_name,
+        client_version,
         if ctt.is_some() { " +ctt" } else { "" },
+        if po_token.is_some() { " +potoken" } else { "" },
+        if oauth_token.is_some() { " +oauth" } else { "" },
+        if yt_cookies.is_some() { " +cookies" } else { "" },
+        if yt_session.is_some() { " +session" } else { "" },
     );
 
     let mut req = http
         .post(url)
         .header("User-Agent", itclient.user_agent)
-        .header("Content-Type", "application/json");
+        .header("Content-Type", "application/json")
+        .header("X-YouTube-Client-Name", itclient.client_name_id.to_string())
+        .header("X-YouTube-Client-Version", client_version);
 
-    if is_web_remix {
-        req = req
-            .header("Origin", "https://music.youtube.com")
-            .header("Referer", "https://music.youtube.com/");
+    match itclient.client_name {
+        "WEB_REMIX" => {
+            req = req
+                .header("Origin", "https://music.youtube.com")
+                .header("Referer", "https://music.youtube.com/");
+
+            // Visitor data — prefer page's visitorData, fall back to generated
+            if let Some(session) = yt_session {
+                if let Some(vd) = session.innertube_context.get("client")
+                    .and_then(|c| c.get("visitorData"))
+                    .and_then(|v| v.as_str())
+                {
+                    req = req.header("X-Goog-Visitor-Id", vd);
+                }
+            } else if let Some(vd) = visitor_data {
+                if !vd.is_empty() {
+                    req = req.header("X-Goog-Visitor-Id", vd);
+                }
+            }
+
+            // Auth: OAuth Bearer > cookie-based triple SAPISIDHASH
+            if let Some(token) = oauth_token {
+                req = req.header("Authorization", format!("Bearer {}", token));
+            } else if let Some(c) = yt_cookies {
+                let user_sid = yt_session.and_then(|s| s.user_session_id.as_deref());
+                req = req
+                    .header("Cookie", &c.cookie_header)
+                    .header(
+                        "Authorization",
+                        crate::cookies::full_sapisidhash(c, "https://music.youtube.com", user_sid),
+                    )
+                    .header("X-Origin", "https://music.youtube.com");
+
+                // Session-specific headers from ytcfg
+                if let Some(session) = yt_session {
+                    if let Some(ref idx) = session.session_index {
+                        req = req.header("X-Goog-Authuser", idx.as_str());
+                    }
+                    if let Some(ref uid) = session.user_session_id {
+                        req = req.header("X-Goog-Pageid", uid.as_str());
+                    }
+                    if session.logged_in {
+                        req = req.header("X-Youtube-Bootstrap-Logged-In", "true");
+                    }
+                }
+            }
+        }
+        "WEB" | "MWEB" => {
+            req = req
+                .header("Origin", "https://www.youtube.com")
+                .header("Referer", "https://www.youtube.com/");
+            if let Some(vd) = visitor_data {
+                if !vd.is_empty() {
+                    req = req.header("X-Goog-Visitor-Id", vd);
+                }
+            }
+            if let Some(token) = oauth_token {
+                req = req.header("Authorization", format!("Bearer {}", token));
+            } else if let Some(c) = yt_cookies {
+                req = req
+                    .header("Cookie", &c.cookie_header)
+                    .header("Authorization", crate::cookies::full_sapisidhash(c, "https://www.youtube.com", None))
+                    .header("X-Origin", "https://www.youtube.com");
+            }
+        }
+        _ => {
+            if let Some(token) = oauth_token {
+                req = req.header("Authorization", format!("Bearer {}", token));
+            }
+        }
     }
 
     let resp = req.json(&body).send().await?;
@@ -309,38 +547,84 @@ async fn innertube_player(
     })
 }
 
-/// Call InnerTube /player, trying WEB_REMIX+ctt first, then IOS/ANDROID fallback.
-/// Also fetches a PoToken from bgutil-pot if available.
+/// Result from get_player_data: player metadata + GVS token + which client succeeded.
+struct PlayerResult {
+    player: PlayerData,
+    gvs_token: Option<GvsToken>,
+    client_config: &'static InnerTubeClient,
+}
+
+/// Call InnerTube /player using WEB_REMIX + ctt + cookies.
+///
+/// WEB_REMIX SABR URLs have an `n` parameter (nsig challenge) that must be
+/// decoded via ytdlp-ejs before the CDN accepts them. The caller handles
+/// nsig decoding after this function returns.
+///
+/// Fallback: IOS (no nsig needed, but 60s throttle without valid PoToken).
 async fn get_player_data(
     http: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
-) -> Result<(PlayerData, Option<String>), SabrError> {
-    // Fetch PoToken from bgutil-pot sidecar (non-blocking — returns None if unavailable).
-    let po_token = fetch_po_token(http, video_id).await;
-    if po_token.is_some() {
-        tracing::info!("[sabr] using PoToken for /player + SABR");
-    }
+    yt_cookies: Option<&crate::cookies::YtCookies>,
+    yt_session: Option<&crate::cookies::YtMusicSession>,
+    _oauth_token: Option<&str>,
+) -> Result<PlayerResult, SabrError> {
+    let gvs = fetch_pot_token(http, Some(video_id)).await;
 
-    // When ctt is available (cast session with YTM Premium), use WEB_REMIX
-    // which is the only client that accepts credentialTransferTokens.
-    // Fall back to IOS -> ANDROID when no ctt.
-    if ctt.is_some() {
-        match innertube_player(http, video_id, &WEB_REMIX_CLIENT, ctt, po_token.as_deref()).await {
-            Ok(data) => return Ok((data, po_token)),
+    // --- Attempt 1: WEB_REMIX + ctt + cookies ---
+    // Requires nsig decoding of SABR URL (handled by caller).
+    if yt_session.is_some() {
+        tracing::info!("[sabr] WEB_REMIX /player (ctt={}, cookies={}, session=true)",
+            ctt.is_some(), yt_cookies.is_some());
+        match innertube_player(
+            http, video_id, &WEB_REMIX_CLIENT, ctt, None, None,
+            yt_cookies, yt_session, None,
+        ).await {
+            Ok(data) => {
+                tracing::info!("[sabr] WEB_REMIX /player OK");
+                return Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &WEB_REMIX_CLIENT });
+            }
             Err(e) => {
-                tracing::warn!("[sabr] WEB_REMIX+ctt failed: {}, trying without ctt", e);
+                tracing::warn!("[sabr] WEB_REMIX /player failed: {}", e);
             }
         }
     }
 
-    match innertube_player(http, video_id, &IOS_CLIENT, None, po_token.as_deref()).await {
-        Ok(data) => Ok((data, po_token)),
-        Err(e) => {
-            tracing::warn!("[sabr] IOS client failed: {}, trying ANDROID", e);
-            let data = innertube_player(http, video_id, &ANDROID_CLIENT, None, po_token.as_deref()).await?;
-            Ok((data, po_token))
-        }
+    // --- Fallback: IOS ---
+    // No nsig needed but 60s throttle (stream_protection_status=2).
+    tracing::info!("[sabr] IOS /player fallback (potoken={})", gvs.is_some());
+    let data = innertube_player(http, video_id, &IOS_CLIENT, None, None, None, None, None, None).await?;
+    tracing::info!("[sabr] IOS /player OK");
+    Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &IOS_CLIENT })
+}
+
+// ---------------------------------------------------------------------------
+// nsig (n-parameter) decoding via ytdlp-ejs
+// ---------------------------------------------------------------------------
+
+/// Decode the `n` parameter in a SABR URL using ytdlp-ejs (SWC + QuickJS).
+///
+/// WEB_REMIX SABR URLs contain an `n` query parameter that must be transformed
+/// using a function embedded in YouTube's base.js player JavaScript. Without
+/// decoding, the CDN returns 403 Forbidden.
+///
+/// This is a blocking operation (QuickJS eval of full base.js) so we run it in
+/// a spawn_blocking context. Uses ~15-20MB RAM (vs ytdlp-ejs SWC: 200MB+).
+fn decode_nsig(player_js: &str, n_value: &str, player_hash: &str) -> Result<String, SabrError> {
+    crate::nsig::decode_nsig(player_js, n_value, player_hash)
+        .map_err(|e| -> SabrError { format!("nsig: {}", e).into() })
+}
+
+/// Replace the `n` parameter in a SABR URL with the decoded value.
+fn replace_n_param(url: &str, decoded_n: &str) -> String {
+    // Parse URL, find &n=XXX or ?n=XXX, replace value
+    if let Some(n_start) = url.find("&n=").or_else(|| url.find("?n=")) {
+        let prefix_end = n_start + 3; // skip "&n=" or "?n="
+        let rest = &url[prefix_end..];
+        let n_end = rest.find('&').unwrap_or(rest.len());
+        format!("{}{}{}", &url[..prefix_end], decoded_n, &rest[n_end..])
+    } else {
+        url.to_owned()
     }
 }
 
@@ -420,6 +704,7 @@ struct SabrState {
     ustreamer_config: Vec<u8>,
     client_config: &'static InnerTubeClient,
     po_token: Option<Vec<u8>>,
+    cookie_header: Option<String>,
     done: bool,
 }
 
@@ -463,6 +748,7 @@ impl SabrState {
             ustreamer_config,
             client_config,
             po_token: None,
+            cookie_header: None,
             done: false,
         }
     }
@@ -779,11 +1065,13 @@ fn handle_context_sending_policy(state: &mut SabrState, data: &[u8]) -> Result<(
 
 fn handle_stream_protection(data: &[u8]) -> Result<(), SabrError> {
     let sps = vs::StreamProtectionStatus::decode(data)?;
-    if sps.status.unwrap_or(0) != 0 {
-        tracing::warn!(
-            "[sabr] stream protection status={} (attestation may be required)",
-            sps.status.unwrap_or(0),
-        );
+    let status = sps.status.unwrap_or(0);
+    match status {
+        0 => tracing::info!("[sabr] stream_protection_status=0 (no protection)"),
+        1 => tracing::info!("[sabr] stream_protection_status=1 (OK — Premium/PoToken accepted!)"),
+        2 => tracing::warn!("[sabr] stream_protection_status=2 (GRACE PERIOD — ~60s then throttle)"),
+        3 => tracing::error!("[sabr] stream_protection_status=3 (HARD BLOCK — no more media)"),
+        n => tracing::warn!("[sabr] stream_protection_status={} (unknown)", n),
     }
     Ok(())
 }
@@ -812,17 +1100,30 @@ async fn sabr_request_cycle(
         state.audio_downloaded_ms, state.audio_total_end_ms,
     );
 
-    let resp = http
+    // CDN headers: content-type, accept, accept-encoding.
+    // WEB_REMIX SABR URLs require cookies on CDN requests (403 without them).
+    let mut req = http
         .post(&url)
-        .header("User-Agent", state.client_config.user_agent)
         .header("Content-Type", "application/x-protobuf")
         .header("Accept", "application/vnd.yt-ump")
-        .body(encoded)
-        .send()
-        .await?;
+        .header("Accept-Encoding", "identity");
+
+    if let Some(ref cookies) = state.cookie_header {
+        req = req.header("Cookie", cookies);
+    }
+
+    let resp = req.body(encoded).send().await?;
 
     if !resp.status().is_success() {
-        return Err(format!("SABR request returned HTTP {}", resp.status()).into());
+        let status = resp.status();
+        let body_preview = resp.text().await.unwrap_or_default();
+        let preview = &body_preview[..body_preview.len().min(200)];
+        return Err(format!(
+            "SABR HTTP {} (client={}, has_potoken={}, has_cookie={}): {}",
+            status, state.client_config.client_name,
+            state.po_token.is_some(), state.playback_cookie.is_some(),
+            preview,
+        ).into());
     }
 
     let mut parser = UmpParser::new();
@@ -923,12 +1224,29 @@ pub async fn stream_audio(
     client: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
+    yt_cookies: Option<&crate::cookies::YtCookies>,
+    yt_session: Option<&crate::cookies::YtMusicSession>,
+    oauth: Option<&std::sync::Arc<crate::oauth::OAuthState>>,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
     if let Some(token) = ctt {
         tracing::info!("[sabr] stream_audio for {} with ctt={}...", video_id, &token[..token.len().min(20)]);
     }
-    // 1. Call InnerTube /player to get streaming metadata (+ PoToken if bgutil-pot is running).
-    let (player, po_token) = get_player_data(client, video_id, ctt).await?;
+    // Get OAuth token if available (auto-refreshes if expired)
+    let oauth_token = if let Some(os) = oauth {
+        os.get_access_token().await
+    } else {
+        None
+    };
+
+    // 1. Call InnerTube /player to get streaming metadata (+ GVS PoToken if bgutil-pot is running).
+    let result = get_player_data(client, video_id, ctt, yt_cookies, yt_session, oauth_token.as_deref()).await?;
+    let player = result.player;
+    let client_config = result.client_config;
+    // get_player_data already handled PoToken selection per attempt:
+    // - Attempt 1 (cookies): no PoToken
+    // - Attempt 2 (bgutil-pot): session-bound PoToken for SABR
+    // - Attempt 3/fallback: no PoToken
+    let gvs_po_token = result.gvs_token.map(|g| g.po_token);
 
     // 2. Pick the best audio format + a video format for the discard trick.
     let audio_fmt = choose_audio_format(&player.formats)
@@ -953,26 +1271,66 @@ pub async fn stream_audio(
         mime_type: audio_fmt.mime_type.clone(),
     };
 
-    // Use WEB_REMIX for SABR when ctt is available (matches the /player call).
-    let client_config: &'static InnerTubeClient = if ctt.is_some() {
-        &WEB_REMIX_CLIENT
-    } else {
-        &IOS_CLIENT
-    };
-
     // 3. Channel for streaming audio bytes to the caller.
     let (tx, rx) = mpsc::channel::<Bytes>(64);
 
-    // 4. Spawn the SABR streaming loop.
+    // 4. Decode nsig if WEB_REMIX SABR URL has `n` parameter.
+    let mut server_url = player.server_abr_streaming_url;
+    if client_config.client_name == "WEB_REMIX" {
+        // Extract `n` param from URL
+        let n_value = {
+            let mut found = None;
+            if let Some(query_start) = server_url.find('?') {
+                for pair in server_url[query_start + 1..].split('&') {
+                    if let Some(val) = pair.strip_prefix("n=") {
+                        found = Some(val.to_owned());
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        if let Some(ref n_val) = n_value {
+            if let Some(session) = yt_session {
+                if let Some(ref js) = session.player_js {
+                    tracing::info!("[sabr] decoding nsig: n={}...", &n_val[..n_val.len().min(10)]);
+                    let js_clone = js.clone();
+                    let n_clone = n_val.clone();
+                    let hash_clone = session.player_hash.clone().unwrap_or_default();
+                    match tokio::task::spawn_blocking(move || decode_nsig(&js_clone, &n_clone, &hash_clone)).await {
+                        Ok(Ok(decoded)) => {
+                            tracing::info!("[sabr] nsig decoded: {} -> {}", n_val, &decoded[..decoded.len().min(10)]);
+                            server_url = replace_n_param(&server_url, &decoded);
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!("[sabr] nsig decode failed: {}", e);
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            tracing::error!("[sabr] nsig task panicked: {}", e);
+                            return Err(format!("nsig task panicked: {}", e).into());
+                        }
+                    }
+                } else {
+                    tracing::warn!("[sabr] WEB_REMIX URL has n= but no player_js cached — CDN will 403");
+                }
+            } else {
+                tracing::warn!("[sabr] WEB_REMIX URL has n= but no session — CDN will 403");
+            }
+        }
+    }
+
+    // 5. Spawn the SABR streaming loop.
     let http = client.clone();
-    let server_url = player.server_abr_streaming_url;
     let ustreamer_config = player.ustreamer_config;
 
     let video_fmt_clone = video_fmt.clone();
+    let cookie_header = yt_cookies.map(|c| c.cookie_header.clone());
     tokio::spawn(async move {
         let result = sabr_loop(
             &http, server_url, &audio_fmt, &video_fmt_clone,
-            ustreamer_config, client_config, po_token, &tx,
+            ustreamer_config, client_config, gvs_po_token, cookie_header, &tx,
         ).await;
 
         match result {
@@ -998,16 +1356,25 @@ async fn sabr_loop(
     ustreamer_config: Vec<u8>,
     client_config: &'static InnerTubeClient,
     po_token: Option<String>,
+    cookie_header: Option<String>,
     tx: &mpsc::Sender<Bytes>,
 ) -> Result<(), SabrError> {
     let mut state = SabrState::new(
         server_url, audio_format, video_format, ustreamer_config, client_config,
     );
+    state.cookie_header = cookie_header;
 
     // Set PoToken for SABR StreamerContext (decoded from base64 to bytes).
+    // bgutil-pot returns URL-safe base64 (uses `-` and `_`) with optional padding.
     if let Some(ref token) = po_token {
         use base64::Engine;
-        match base64::engine::general_purpose::STANDARD.decode(token) {
+        use base64::engine::{GeneralPurpose, GeneralPurposeConfig, DecodePaddingMode};
+        const URL_SAFE_LENIENT: GeneralPurpose = GeneralPurpose::new(
+            &base64::alphabet::URL_SAFE,
+            GeneralPurposeConfig::new()
+                .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+        );
+        match URL_SAFE_LENIENT.decode(token) {
             Ok(bytes) => {
                 tracing::info!("[sabr] PoToken set ({} bytes)", bytes.len());
                 state.po_token = Some(bytes);

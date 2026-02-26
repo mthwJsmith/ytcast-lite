@@ -86,6 +86,7 @@ pub enum PlayerCommand {
         current_time: f64,
         list_id: String,
         ctt: Option<String>,
+        params: Option<String>,
     },
     SetVideo {
         video_id: String,
@@ -106,7 +107,8 @@ pub enum PlayerCommand {
     Stop,
     Previous,
     Next,
-    RemoteDisconnected,
+    RemoteConnected { theme: String },
+    RemoteDisconnected { theme: String },
     UpdatePlaylist {
         video_ids: Vec<String>,
         list_id: String,
@@ -342,7 +344,7 @@ impl LoungeSession {
             ));
         }
 
-        tracing::info!("lounge session bound: SID={}, gsession={}", self.sid, self.gsessionid);
+        tracing::info!("[lounge:{}] session bound: SID={}, gsession={}", self.theme, self.sid, self.gsessionid);
         Ok(messages)
     }
 
@@ -396,7 +398,7 @@ impl LoungeSession {
             ));
         }
 
-        tracing::info!("lounge reconnected: SID={}, gsession={}", self.sid, self.gsessionid);
+        tracing::info!("[lounge:{}] reconnected: SID={}, gsession={}", self.theme, self.sid, self.gsessionid);
         Ok(messages)
     }
 
@@ -501,6 +503,8 @@ impl LoungeSession {
         let body = encode_outgoing(messages, self.ofs);
         self.ofs += messages.len() as u32;
 
+        tracing::debug!("[lounge] POST body: {}", &body[..body.len().min(500)]);
+
         let resp = self
             .client
             .post(BIND_URL)
@@ -584,8 +588,13 @@ fn dispatch_messages(
             // -- Remote device lifecycle --
             "remoteConnected" => {
                 let name = msg.args.get("name").map(String::as_str).unwrap_or("unknown");
-                tracing::info!("remote connected: {name}");
-                // Tell the phone we're ready — without these the phone hangs on "connecting"
+                tracing::info!("[lounge:{}] remote connected: {name}", session.theme);
+                send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone() });
+                // Tell the phone we're ready — matches yt-cast-receiver handleSenderConnected:
+                // 1. onHasPreviousNextChanged
+                // 2. nowPlaying (empty = nothing playing)
+                // 3. onStateChange (idle)
+                // 4. onAutoplayModeChanged (UNSUPPORTED — we don't do autoplay)
                 responses.push(
                     OutgoingMessage::new("onHasPreviousNextChanged")
                         .with_arg("hasPrevious", "false")
@@ -598,11 +607,15 @@ fn dispatch_messages(
                     OutgoingMessage::new("onStateChange")
                         .with_arg("state", "-1"),
                 );
+                responses.push(
+                    OutgoingMessage::new("onAutoplayModeChanged")
+                        .with_arg("autoplayMode", "UNSUPPORTED"),
+                );
             }
             "remoteDisconnected" => {
                 let name = msg.args.get("name").map(String::as_str).unwrap_or("unknown");
-                tracing::info!("remote disconnected: {name}");
-                send_cmd(player_tx, PlayerCommand::RemoteDisconnected);
+                tracing::info!("[lounge:{}] remote disconnected: {name}", session.theme);
+                send_cmd(player_tx, PlayerCommand::RemoteDisconnected { theme: session.theme.clone() });
             }
 
             // -- Lounge status --
@@ -613,7 +626,8 @@ fn dispatch_messages(
                     .map(|d| d.contains("REMOTE_CONTROL"))
                     .unwrap_or(false);
                 if has_senders {
-                    tracing::info!("loungeStatus has remote senders, sending readiness");
+                    tracing::info!("[lounge:{}] loungeStatus has remote senders, sending readiness", session.theme);
+                    send_cmd(player_tx, PlayerCommand::RemoteConnected { theme: session.theme.clone() });
                     responses.push(
                         OutgoingMessage::new("onHasPreviousNextChanged")
                             .with_arg("hasPrevious", "false")
@@ -621,6 +635,10 @@ fn dispatch_messages(
                     );
                     responses.push(
                         OutgoingMessage::new("nowPlaying"),
+                    );
+                    responses.push(
+                        OutgoingMessage::new("onAutoplayModeChanged")
+                            .with_arg("autoplayMode", "UNSUPPORTED"),
                     );
                 }
             }
@@ -670,6 +688,11 @@ fn dispatch_messages(
                 send_cmd(player_tx, PlayerCommand::Next);
             }
 
+            "forceDisconnect" => {
+                let reason = msg.args.get("reason").map(String::as_str).unwrap_or("unknown");
+                tracing::warn!("forceDisconnect: {reason}");
+            }
+
             other => {
                 tracing::debug!("unhandled lounge command: {other} args={:?}", msg.args);
             }
@@ -709,6 +732,7 @@ fn dispatch_set_playlist(args: &HashMap<String, String>, player_tx: &mpsc::Sende
 
     let list_id = args.get("listId").cloned().unwrap_or_default();
     let ctt = args.get("ctt").cloned();
+    let params = args.get("params").cloned();
 
     send_cmd(player_tx, PlayerCommand::SetPlaylist {
         video_id,
@@ -717,6 +741,7 @@ fn dispatch_set_playlist(args: &HashMap<String, String>, player_tx: &mpsc::Sende
         current_time,
         list_id,
         ctt,
+        params,
     });
 }
 
@@ -800,6 +825,7 @@ pub async fn run_lounge(
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut session = LoungeSession::new(client.clone(), device_name, uuid, screen_id, theme);
+    let theme_tag = format!("[lounge:{}]", session.theme);
     let mut state_rx = state_rx;
     let mut shutdown = shutdown;
 
@@ -831,11 +857,11 @@ pub async fn run_lounge(
         }
 
         // -- Get lounge token --
-        tracing::info!("obtaining lounge token for screen {}", session.screen_id);
+        tracing::info!("{} obtaining lounge token for screen {}", theme_tag, session.screen_id);
         match get_lounge_token(&session.client, &session.screen_id).await {
             Ok(token) => {
                 session.lounge_token = token;
-                tracing::info!("lounge token acquired");
+                tracing::info!("{} lounge token acquired", theme_tag);
             }
             Err(e) => {
                 tracing::error!("failed to get lounge token: {e}");
@@ -921,9 +947,17 @@ pub async fn run_lounge(
                             batch.push(extra);
                         }
 
+                        tracing::info!(
+                            "[lounge:{}] sending {} state messages: [{}]",
+                            session.theme,
+                            batch.len(),
+                            batch.iter().map(|m| m.command.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+
                         match session.send_messages(&batch).await {
                             Ok(()) => {
                                 retry_count = 0;
+                                tracing::info!("[lounge:{}] state messages sent OK", session.theme);
                             }
                             Err(LoungeError::UnknownSid) => {
                                 tracing::warn!("unknown SID on send, reconnecting");

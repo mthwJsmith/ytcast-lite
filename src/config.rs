@@ -56,6 +56,9 @@ impl From<serde_json::Error> for ConfigError {
 pub struct Config {
     pub uuid: String,
     pub screen_id: String,
+    /// Screen ID for the YouTube Music ("m" theme) Lounge session.
+    #[serde(default)]
+    pub screen_id_m: String,
 }
 
 impl Config {
@@ -74,6 +77,7 @@ impl Config {
                 let config = Config {
                     uuid: uuid::Uuid::new_v4().to_string(),
                     screen_id: String::new(),
+                    screen_id_m: String::new(),
                 };
                 config.save()?;
                 tracing::info!("created new config at {}", path.display());

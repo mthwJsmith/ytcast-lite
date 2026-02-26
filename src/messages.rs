@@ -69,18 +69,45 @@ impl OutgoingMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
 pub enum PlayerState {
+    Idle = -1,
     Stopped = 0,
     Playing = 1,
     Paused = 2,
+    Loading = 3,
 }
 
 impl PlayerState {
     pub fn as_str(self) -> &'static str {
         match self {
+            PlayerState::Idle => "-1",
             PlayerState::Stopped => "0",
             PlayerState::Playing => "1",
             PlayerState::Paused => "2",
+            PlayerState::Loading => "3",
         }
+    }
+}
+
+/// Generate a stable content playback nonce (CPN) — 16 hex chars.
+/// This should be generated once per session and reused across all state reports.
+pub fn generate_cpn() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..16)
+        .map(|_| format!("{:x}", rng.gen_range(0u8..16)))
+        .collect()
+}
+
+/// Format a time/duration value for the Lounge API.
+///
+/// Matches JavaScript's `Number.toString()` behavior:
+/// - Whole numbers: `"191"` not `"191.000"`
+/// - Fractional: `"42.567"` not `"42.567000"`
+pub fn fmt_time(val: f64) -> String {
+    if val.fract() == 0.0 {
+        format!("{}", val as i64)
+    } else {
+        format!("{}", val)
     }
 }
 

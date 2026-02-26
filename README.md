@@ -1,8 +1,10 @@
 # ytcast-open
 
+> **Known issue (Feb 2026):** YouTube Music has a server-side casting bug affecting certain songs across all cast targets — including official Chromecast, Nest speakers, and Android TV. Some tracks show a loading spinner or "Sorry, something went wrong" when cast, while playing fine locally on the phone. This is not a ytcast-open bug. See: [Reddit thread 1](https://www.reddit.com/r/YoutubeMusic/comments/1rdirhx/sorry_something_went_wrong_when_youre_ready_give/), [Reddit thread 2](https://www.reddit.com/r/YoutubeMusic/comments/1r9zu7v/casting_to_honedevices_stopped_working/). Confirmed by testing with a Pixel 9a casting to both this receiver and a Sony Android TV — same failures on both.
+
 A lightweight YouTube Music cast receiver written in Rust. Makes a Raspberry Pi (or any Linux device) appear as a cast target in YouTube Music. Tap Cast, see your device, play music through MPD.
 
-**3.8MB RAM idle. 2.4MB single binary. One optional sidecar for PoToken.**
+**~13MB RAM idle. Single binary. One optional sidecar for PoToken.**
 
 Audio streaming powered by [sabr-rs](https://github.com/mthwJsmith/sabr-rs), my Rust implementation of YouTube's SABR protocol.
 
@@ -45,7 +47,7 @@ Unlike direct URL approaches that break when YouTube changes client policies, SA
 5. Extracts and streams audio segments as chunked HTTP to MPD
 6. Reports buffered ranges so the server sends the next segments
 
-The SABR code adds roughly 1200 lines of Rust across 3 files. Proto definitions (18 `.proto` files) are compiled at build time via `prost-build`. This replaced an earlier Node.js SABR proxy (ytresolve) that used ~84MB RSS on its own.
+The SABR code adds roughly 1800 lines of Rust across 3 files. Proto definitions (18 `.proto` files) are compiled at build time via `prost-build`. This replaced an earlier Node.js SABR proxy (ytresolve) that used ~84MB RSS on its own.
 
 ## Features
 
@@ -57,6 +59,10 @@ The SABR code adds roughly 1200 lines of Rust across 3 files. Proto definitions 
 - Graceful disconnect (stops playback when phone disconnects)
 - Best-quality Opus audio (itag 251, up to ~160kbps, 48kHz stereo)
 - Authenticated streaming via cast session credential transfer tokens (WEB_REMIX + ctt)
+- Full YouTube Music session context (fetches live ytcfg from music.youtube.com for WEB_REMIX /player)
+- n-parameter (nsig) challenge decoding via embedded yt-dlp/ejs solver in QuickJS
+- Dual Lounge sessions (YouTube + YouTube Music themes) for broad compatibility
+- Debug HTTP endpoints for testing without a phone (`/debug/play/VIDEO_ID`, `/debug/pause`, etc.)
 
 ## Requirements
 
@@ -104,15 +110,17 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `main.rs` | ~750 | Entry point, player command loop, MPD idle events, auto-advance |
-| `lounge.rs` | ~1020 | YouTube Lounge API - session management, streaming long-poll, command parsing |
-| `messages.rs` | ~510 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
-| `innertube.rs` | ~150 | Stream resolver - InnerTube /player for metadata (WEB_REMIX+ctt or ANDROID fallback) |
-| `mpd.rs` | ~340 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
-| `ssdp.rs` | ~100 | SSDP multicast discovery responder |
-| `dial.rs` | ~290 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint |
-| `config.rs` | ~50 | JSON config (UUID, screen_id) load/save |
-| `sabr/stream.rs` | ~1050 | SABR streaming - InnerTube /player, PoToken fetch, format selection, SABR request loop, UMP parsing |
+| `main.rs` | ~1500 | Entry point, player command loop, MPD idle events, auto-advance, debug endpoints |
+| `lounge.rs` | ~1090 | YouTube Lounge API - session management, streaming long-poll, command parsing |
+| `messages.rs` | ~540 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
+| `cookies.rs` | ~410 | Cookie loading, YouTube Music session extraction (ytcfg), triple SAPISIDHASH auth |
+| `innertube.rs` | ~250 | InnerTube /player for metadata (WEB_REMIX+ctt with full context, or IOS fallback) |
+| `nsig.rs` | ~250 | n-parameter challenge decoder using yt-dlp/ejs solver in QuickJS |
+| `mpd.rs` | ~420 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
+| `ssdp.rs` | ~280 | SSDP multicast discovery responder |
+| `dial.rs` | ~420 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint |
+| `config.rs` | ~110 | JSON config (UUID, screen_id, screen_id_m) load/save |
+| `sabr/stream.rs` | ~1450 | SABR streaming - InnerTube /player, PoToken fetch, nsig decode, format selection, SABR request loop, UMP parsing |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |
 | `sabr/mod.rs` | ~12 | Module glue + protobuf includes |
 
@@ -124,12 +132,12 @@ RSS = Resident Set Size (actual physical RAM used by the process).
 
 | Component | RAM (RSS) |
 |-----------|-----------|
-| ytcast-open idle | ~3.8MB |
-| ytcast-open during SABR streaming | ~5-8MB |
+| ytcast-open idle | ~12.8MB |
+| ytcast-open during SABR streaming | ~41MB (55MB peak during nsig decode, settles back) |
 | bgutil-pot (PoToken sidecar, optional) | ~66MB |
 | MPD | ~10MB |
-| **Total system (without bgutil-pot)** | **~15-20MB** |
-| **Total system (with bgutil-pot)** | **~80-85MB** |
+| **Total system (without bgutil-pot)** | **~55-65MB** |
+| **Total system (with bgutil-pot)** | **~120-130MB** |
 
 The previous architecture used a Node.js SABR proxy (ytresolve, ~84MB) alongside the Rust binary. That's gone now. All SABR streaming is built into the single binary via [sabr-rs](https://github.com/mthwJsmith/sabr-rs).
 
@@ -139,7 +147,7 @@ The bgutil-pot sidecar generates PoTokens (BotGuard attestation) needed to preve
 
 | | ytcast-open (current) | Previous (Rust + Node.js ytresolve) | Typical yt-dlp setup |
 |-|----------------------|-------------------------------------|---------------------|
-| Idle RAM | **~3.8MB** | ~60MB (3.8MB + 55MB Node) | 50-90MB per invocation |
+| Idle RAM | **~12.8MB** | ~60MB (3.8MB + 55MB Node) | 50-90MB per invocation |
 | Binary/install | **2.4MB single binary** | 2.4MB + 2MB node_modules | Python + yt-dlp + JS runtime |
 | Runtime deps | **None** | Node.js 18+ | Python + JS runtime |
 | Startup | ~50ms | ~2s (Node.js) | 2-5s per video |
@@ -150,6 +158,7 @@ The bgutil-pot sidecar generates PoTokens (BotGuard attestation) needed to preve
 
 - [sabr-rs](https://github.com/mthwJsmith/sabr-rs) - our Rust SABR implementation (extracted as a standalone crate)
 - [googlevideo](https://github.com/LuanRT/googlevideo) by LuanRT - TypeScript SABR reference implementation + proto definitions
+- [yt-dlp/ejs](https://github.com/nichobi/ejs) - JavaScript-based n-parameter (nsig) challenge solver, embedded in QuickJS
 - [bgutil-ytdlp-pot-provider-rs](https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs) by jim60105 - Rust PoToken provider (BotGuard attestation)
 - [rustypipe-botguard](https://github.com/tobiashenkel/rustypipe-botguard) - Rust BotGuard challenge solver used by bgutil-pot
 - [yt-cast-receiver](https://github.com/patrickkfkan/yt-cast-receiver) by patrickkfkan - Node.js cast receiver framework (protocol reference)

@@ -67,11 +67,29 @@ mod real {
     pub struct MpdClient {
         reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
         writer: BufWriter<tokio::io::WriteHalf<TcpStream>>,
+        host: String,
+        port: u16,
     }
 
     impl MpdClient {
         /// Connect to MPD and consume the greeting line (`OK MPD x.x.x`).
         pub async fn connect(host: &str, port: u16) -> Result<Self> {
+            let (reader, writer) = Self::connect_inner(host, port).await?;
+            Ok(Self {
+                reader,
+                writer,
+                host: host.to_owned(),
+                port,
+            })
+        }
+
+        async fn connect_inner(
+            host: &str,
+            port: u16,
+        ) -> Result<(
+            BufReader<tokio::io::ReadHalf<TcpStream>>,
+            BufWriter<tokio::io::WriteHalf<TcpStream>>,
+        )> {
             let stream = TcpStream::connect((host, port)).await?;
             let (rd, wr) = tokio::io::split(stream);
             let mut reader = BufReader::new(rd);
@@ -90,7 +108,15 @@ mod real {
             }
 
             tracing::info!("connected to MPD at {host}:{port} — {}", greeting.trim());
-            Ok(Self { reader, writer })
+            Ok((reader, writer))
+        }
+
+        async fn reconnect(&mut self) -> Result<()> {
+            tracing::info!("[MPD] reconnecting command connection...");
+            let (reader, writer) = Self::connect_inner(&self.host, self.port).await?;
+            self.reader = reader;
+            self.writer = writer;
+            Ok(())
         }
 
         // -- queue / playback ------------------------------------------------
@@ -182,8 +208,25 @@ mod real {
 
         // -- protocol layer --------------------------------------------------
 
-        /// Send a command and return the response lines (excluding the final `OK`).
+        /// Send a command, auto-reconnecting once on connection errors
+        /// (Io errors, "connection closed"). ACK errors from MPD are NOT retried.
         async fn command(&mut self, cmd: &str) -> Result<Vec<String>> {
+            match self.command_raw(cmd).await {
+                Ok(lines) => Ok(lines),
+                Err(e @ MpdError::Ack(_)) => Err(e),
+                Err(_) => {
+                    // Io or Protocol error = connection broken. Reconnect + retry.
+                    if let Err(e) = self.reconnect().await {
+                        tracing::error!("[MPD] reconnect failed: {e}");
+                        return Err(e);
+                    }
+                    self.command_raw(cmd).await
+                }
+            }
+        }
+
+        /// Send a raw command (no reconnect logic).
+        async fn command_raw(&mut self, cmd: &str) -> Result<Vec<String>> {
             // Write command
             self.writer.write_all(cmd.as_bytes()).await?;
             self.writer.write_all(b"\n").await?;

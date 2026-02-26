@@ -2,3 +2,12 @@
 *.tmp
 *.swp
 *.swo
+*.stackdump
+
+# Test/debug scripts (contain hardcoded paths)
+test_*.py
+capture_*.py
+
+# Research/notes
+Musika_research/
+pibug.md
